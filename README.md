@@ -38,15 +38,57 @@ Change them any time from the group, as admin:
 ```
 No restart needed — changes save straight to `config.json` and apply immediately.
 
-## 4. Daily use
+## 4. Assign workers to shifts
+This is what makes lateness/fines accurate — without it, the bot just
+guesses the closest shift, which is fine for casual use but not for payroll.
+
+Reply to a message the worker has sent in the group with:
+```
+/setworker main
+```
+(or `/setworker <user_id> main` if you already know their Telegram ID from `/myid`).
+
+- `/workers` — list everyone currently assigned and their shift.
+- `/removeworker` (as a reply) or `/removeworker <user_id>` — unassign someone.
+
+Reassigning is just running `/setworker` again with the new shift name — no
+need to remove first.
+
+## 5. Daily use
 - The bot automatically posts fresh Check In/Out buttons (and pins them,
   unpinning the previous day's) at the start of each shift.
-- Staff just tap the button that applies — the bot figures out which shift
-  they mean and whether they're on time.
+- Staff tap the button that applies. If they're assigned to a shift, the bot
+  checks them against THEIR schedule specifically.
+- Check-ins more than `early_checkin_minutes` (default 60) before a shift's
+  start are rejected with a message telling them the earliest allowed time —
+  e.g. a 7am shift can't be checked into before 6am.
 - `/report` — today's log, right in the chat.
-- `/export` or `/export 7` — download a CSV of the last 30 (or N) days.
+- `/export` or `/export 7` — download a CSV of the last 30 (or N) days (raw log, no fines).
 
-## 5. Deploy so it runs 24/7
+## 6. Weekly & monthly reports
+- `/weekly` — CSV covering the current calendar week (Monday–Sunday):
+  late minutes and early-checkout minutes per assigned worker, per day.
+  **No dollar amounts** — this is for keeping an eye on patterns.
+- `/monthly` or `/monthly 2026-08` — CSV covering a calendar month, this time
+  **with fines calculated**, plus a summary of each worker's total for the
+  month right in the caption. Fine rules:
+  - Missing check-in and/or check-out for a shift → flat **$25** (charged
+    once even if both are missing that day)
+  - Late check-in: under 25 min → $0, 25–44 min → **$15**, 45+ min → **$25**
+    plus **$10** for every additional full hour beyond 45 min
+    (e.g. 1h45m late = $25 + $10 = $35)
+  - Early check-out → reported, never fined
+
+Both reports only cover workers who've been assigned via `/setworker` — there's
+no way to judge lateness or flag a missing punch without knowing someone's
+schedule.
+
+**Known limitation:** the bot assumes every assigned worker works their shift
+every day of the period. If someone has a day off, that day will show as a
+"missing punch" fine unless you manually edit it out of the CSV before acting
+on it. Let me know if you want a day-off/schedule-exception feature added.
+
+## 7. Deploy so it runs 24/7
 Easiest option: **Railway.app** (free tier is plenty for this).
 1. Push this folder to a GitHub repo.
 2. On railway.app → New Project → Deploy from GitHub repo → pick the repo.
