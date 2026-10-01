@@ -4,7 +4,24 @@ One bot, two jobs:
 1. **Attendance** — Check In/Out buttons, shift assignment, late/early tracking, weekly/monthly reports with attendance fines.
 2. **Finance** — rejection/charge/bonus logging, company expenses, and two private monthly Excel reports built from your Google Sheet dispatch board plus everything logged in the bot.
 
-This file only covers what's **new** (finance). For the original attendance setup (BotFather, Railway, GitHub deploy, shift assignment), see the setup steps you already have from before — nothing about that changed.
+This file only covers what's **new** (finance). For the original attendance setup (BotFather, GitHub deploy, shift assignment), see the setup steps you already have from before — nothing about that changed.
+
+## ⚠️ Set up persistent storage before you do anything else
+
+Without this, **every time you push an update to GitHub, Railway wipes all your data** — admins, worker assignments, attendance history, and all logged charges/bonuses. This almost certainly just happened to you. Fix it once, now:
+
+1. On Railway, click into the FaceControl_bot box → **Settings** tab.
+2. Find **Volumes** in the left-side settings list → click **+ New Volume**.
+3. Set the mount path to `/data` → create it.
+4. Go to the **Variables** tab → add a new variable: `DATA_DIR` = `/data`.
+5. This triggers a redeploy. Once it's done, your admin list, worker assignments, and attendance history will persist across every future update — you'll never have to redo this setup again.
+
+**Recovering from the wipe that already happened:**
+1. Run `/addadmin` (no arguments) — since the admin list is currently empty, this works for anyone and makes you admin again.
+2. Redo `/setworker <shift> <SheetName>` (reply to each worker's message) for everyone.
+3. Redo `/addviewer` for your 4 bosses.
+4. Redo `/setrejectionfee 200` (and any other settings you'd changed).
+5. Do steps 1-4 **after** setting up the Volume above, so this is the last time you ever have to redo them.
 
 ## Roles
 
