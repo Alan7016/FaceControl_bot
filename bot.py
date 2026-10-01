@@ -65,9 +65,17 @@ from telegram.ext import (
 # Config & storage
 # --------------------------------------------------------------------------
 
+import os
+
 BASE_DIR = Path(__file__).parent
-CONFIG_PATH = BASE_DIR / "config.json"
-DB_PATH = BASE_DIR / "checkins.db"
+# DATA_DIR should point at a persistent Volume on Railway (see README) so a
+# redeploy never wipes admins, worker assignments, attendance history, or
+# ledger entries. Falls back to the code directory for local testing, where
+# persistence across runs doesn't matter.
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = DATA_DIR / "config.json"
+DB_PATH = DATA_DIR / "checkins.db"
 
 DEFAULT_CONFIG = {
     # attendance
