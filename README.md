@@ -1,107 +1,91 @@
-# Dispatcher Check-In/Out Bot
+# FaceControl_bot — Attendance + Finance
 
-Telegram bot that posts Check In / Check Out buttons in your staff group,
-matches each tap to the closest shift, flags late arrivals or early
-departures, and logs everything to a local database.
+One bot, two jobs:
+1. **Attendance** — Check In/Out buttons, shift assignment, late/early tracking, weekly/monthly reports with attendance fines.
+2. **Finance** — rejection/charge/bonus logging, company expenses, and two private monthly Excel reports built from your Google Sheet dispatch board plus everything logged in the bot.
 
-## 1. Create the bot
-1. Message **@BotFather** on Telegram → `/newbot` → follow the prompts.
-2. Copy the token it gives you (looks like `123456789:AAExxxxxxxxxxxxxxxxxxxxxxx`).
-3. Add the bot to your staff group, and **make it an admin** of the group
-   (it needs admin rights to pin messages).
+This file only covers what's **new** (finance). For the original attendance setup (BotFather, Railway, GitHub deploy, shift assignment), see the setup steps you already have from before — nothing about that changed.
 
-## 2. Run it locally first (to test)
-```bash
-pip install -r requirements.txt
-export BOT_TOKEN="paste-your-token-here"
-python bot.py
+## Roles
+
+- **Admins** (you): full control — every command, including the private-only ones.
+- **Viewers** (the 4 bosses): read-only — `/weekly`, `/monthly`, `/financesettings`. Cannot log charges, bonuses, or expenses, and cannot change any settings.
+
+Add a viewer the same way you add a worker — reply to their message:
+```
+/addviewer
+```
+or `/addviewer <user_id>` directly.
+
+## Linking a worker to their Google Sheet name
+
+The dispatch board identifies people by the name in the **DISPATCH** column (e.g. "Doniyor", "Asilbek"). For finance reports to match a Telegram worker to their sheet entries, link the two when you assign their shift:
+
+```
+/setworker main Doniyor        (reply to their message)
+```
+or
+```
+/setworker <user_id> main Doniyor
 ```
 
-Then in the group:
-- Send `/myid` to get your Telegram user ID and the group's chat ID.
-- Send `/addadmin` (with no arguments, while the admin list is still empty)
-  to make yourself the first admin — after that, only admins can add others
-  with `/addadmin <user_id>`.
-- Send `/setgroup` (as admin) so the bot knows which chat to auto-post the
-  attendance buttons in every day.
-- Send `/post` any time to manually post the Check In/Out buttons right now.
+Check it worked with `/workers` — it'll show the linked sheet name next to each person.
 
-## 3. Configure shifts
-Current defaults: morning 07:00–15:00, main 15:00–23:00, night 23:00–07:00,
-10-minute grace period, Asia/Tashkent timezone.
+## Logging charges, bonuses, expenses
 
-Change them any time from the group, as admin:
+**In the group** (visible — these name a specific person's work issue):
 ```
-/setshift morning 08:00 16:00
-/setgrace 15
-/shifts        (view current config)
+/rejection                 (reply to the dispatcher's message)
+/rejection Asilbek         (or name them directly)
+
+/charge 30 missed call with broker      (reply to their message)
+/charge Asilbek 30 missed call with broker
 ```
-No restart needed — changes save straight to `config.json` and apply immediately.
 
-## 4. Assign workers to shifts
-This is what makes lateness/fines accurate — without it, the bot just
-guesses the closest shift, which is fine for casual use but not for payroll.
-
-Reply to a message the worker has sent in the group with:
+**DM the bot privately** (never posted anywhere dispatchers can see):
 ```
-/setworker main
+/expense 300 fuel reimbursement
+/bonus Doniyor 100 great month
 ```
-(or `/setworker <user_id> main` if you already know their Telegram ID from `/myid`).
 
-- `/workers` — list everyone currently assigned and their shift.
-- `/removeworker` (as a reply) or `/removeworker <user_id>` — unassign someone.
+Change the rules any time:
+```
+/setrejectionfee 50       (dollar amount per rejection)
+/setdispatchfee 3         (company's % of gross)
+/setcommission 1          (dispatcher's % of their own gross)
+/financesettings          (view current numbers)
+```
 
-Reassigning is just running `/setworker` again with the new shift name — no
-need to remove first.
+## Monthly dispatch board report
 
-## 5. Daily use
-- The bot automatically posts fresh Check In/Out buttons (and pins them,
-  unpinning the previous day's) at the start of each shift.
-- Staff tap the button that applies. If they're assigned to a shift, the bot
-  checks them against THEIR schedule specifically.
-- Check-ins more than `early_checkin_minutes` (default 60) before a shift's
-  start are rejected with a message telling them the earliest allowed time —
-  e.g. a 7am shift can't be checked into before 6am.
-- `/report` — today's log, right in the chat.
-- `/export` or `/export 7` — download a CSV of the last 30 (or N) days (raw log, no fines).
+1. In Google Sheets, open your Dispatch board tab → **File → Download → Comma-separated values (.csv)** (or keep it as .xlsx if you prefer — both work).
+2. **DM the file to the bot** (not the group). In the caption, write the month you want, e.g. `September 2026` or `2026-09`. If you leave the caption blank, it uses the most recent month found in the file.
+3. The bot replies privately with two files:
+   - **Main Gross** — per-MC-company breakdown (loads, miles, RPM, gross), average weekly gross, active days, total payout, company income (your %), expenses, and the final remainder.
+   - **Dispatchers Gross** — per dispatcher: gross (with a breakdown by company further down), commission, bonuses, charges (itemized below), and their net dispatch fee (commission + bonuses − charges, including attendance fines).
 
-## 6. Weekly & monthly reports
-- `/weekly` — CSV covering the current calendar week (Monday–Sunday):
-  late minutes and early-checkout minutes per assigned worker, per day.
-  **No dollar amounts** — this is for keeping an eye on patterns.
-- `/monthly` or `/monthly 2026-08` — CSV covering a calendar month, this time
-  **with fines calculated**, plus a summary of each worker's total for the
-  month right in the caption. Fine rules:
-  - Missing check-in and/or check-out for a shift → flat **$25** (charged
-    once even if both are missing that day)
-  - Late check-in: under 25 min → $0, 25–44 min → **$15**, 45+ min → **$25**
-    plus **$10** for every additional full hour beyond 45 min
-    (e.g. 1h45m late = $25 + $10 = $35)
-  - Early check-out → reported, never fined
+Only you receive these (not the 4 bosses) — forward them yourself if you want to share.
 
-Both reports only cover workers who've been assigned via `/setworker` — there's
-no way to judge lateness or flag a missing punch without knowing someone's
-schedule.
+## Important limitations to know about
 
-**Known limitation:** the bot assumes every assigned worker works their shift
-every day of the period. If someone has a day off, that day will show as a
-"missing punch" fine unless you manually edit it out of the CSV before acting
-on it. Let me know if you want a day-off/schedule-exception feature added.
+- **The sheet export should be just the Dispatch board tab.** Other tabs (Dispatch fee, per-MC tabs, Payments) aren't read — you said income only needs that one tab, and expenses are logged directly in the bot instead.
+- **Any Rate $ counts toward gross and commission, regardless of status** — including the CANCELED-but-still-charged rows, per what you confirmed.
+- **Day-off safe:** a dispatcher's attendance fines only count real problems — late arrival, early leaving, or forgetting one side of a check-in/out pair. A day with zero activity at all is treated as a day off, never fined. (This is different from the standalone `/monthly` attendance report, which still fines every blank day — that one's for attendance review, not payroll, so it stays stricter.)
+- **Net payout can go negative** if someone's charges exceed their commission — the report shows the real negative number rather than flooring it at zero. That's your call to make each month, not the bot's.
+- **Pickup dates without a year** (the sheet only shows "Aug 1, 22:45 EDT") mean month-matching relies on the divider rows in your sheet ("August", "September", etc.) rather than the dates themselves — so those divider rows must stay in the export.
+- Rows where the parser can't find a pickup date are simply excluded from the "Active days" count rather than guessed at.
 
-## 7. Deploy so it runs 24/7
-Easiest option: **Railway.app** (free tier is plenty for this).
-1. Push this folder to a GitHub repo.
-2. On railway.app → New Project → Deploy from GitHub repo → pick the repo.
-3. In the project's Variables tab, add `BOT_TOKEN` = your token.
-4. Railway auto-detects `requirements.txt` and runs `python bot.py`. Done —
-   it'll stay online and restart itself if it ever crashes.
+## Full command list (new, finance-related)
 
-(Render.com's free "Background Worker" service works the same way, if you'd
-rather use that instead.)
-
-## Notes
-- `checkins.db` (SQLite) holds all history — back it up occasionally if you
-  want to keep records long-term; it isn't wiped on redeploy on Railway but
-  is worth exporting via `/export` periodically as a safety net.
-- Because polling is used (not webhooks), there's no public URL or SSL
-  certificate to manage — it just needs to keep running.
+| Command | Who | Where |
+|---|---|---|
+| `/rejection` (reply or name) | Admin | Group |
+| `/charge <amount> <reason>` (reply) / `/charge <name> <amount> <reason>` | Admin | Group |
+| `/expense <amount> <description>` | Admin | **DM only** |
+| `/bonus <name> <amount> <note>` | Admin | **DM only** |
+| `/setrejectionfee <amount>` | Admin | Either |
+| `/setdispatchfee <percent>` | Admin | Either |
+| `/setcommission <percent>` | Admin | Either |
+| `/financesettings` | Admin/Viewer | Either |
+| `/addviewer` (reply) / `/addviewer <user_id>` | Admin | Either |
+| Send the dispatch board file | Admin | **DM only** |
