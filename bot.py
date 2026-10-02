@@ -51,7 +51,15 @@ from datetime import datetime, timedelta, time as dtime, date as ddate
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeChat,
+)
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
     Application,
@@ -335,7 +343,70 @@ def sheet_name_for(cfg: dict, user_id: int):
 # Basic / shared commands
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Telegram's native "/" command menu — so the command list looks like a real
+# app instead of something you have to memorize. Admins (who DM'd the bot at
+# least once, so Telegram has a chat to attach a menu to) see the full list;
+# everyone else sees the short, safe-to-share one.
+# --------------------------------------------------------------------------
+
+PUBLIC_COMMANDS = [
+    BotCommand("myid", "Show your Telegram ID"),
+    BotCommand("shifts", "Shift times, grace period, earliest check-in"),
+    BotCommand("weekly", "This week's attendance (no fines)"),
+    BotCommand("monthly", "This month's attendance (with fines)"),
+    BotCommand("financesettings", "View rejection fee / dispatch fee / commission"),
+]
+
+ADMIN_COMMANDS = PUBLIC_COMMANDS + [
+    BotCommand("post", "Post Check In/Out buttons in the group"),
+    BotCommand("setgroup", "Mark this group as the attendance group"),
+    BotCommand("setshift", "Edit a shift's start/end time"),
+    BotCommand("setgrace", "Set the grace period (minutes)"),
+    BotCommand("setearly", "Set the earliest check-in window"),
+    BotCommand("addadmin", "Add an admin"),
+    BotCommand("addviewer", "Add a read-only viewer (reply to them)"),
+    BotCommand("setworker", "Assign a worker to a shift + sheet name"),
+    BotCommand("removeworker", "Remove a worker"),
+    BotCommand("workers", "List assigned workers"),
+    BotCommand("rejection", "Log a rejection charge (reply or name)"),
+    BotCommand("charge", "Log a custom charge (reply or name)"),
+    BotCommand("expense", "Log a company expense — DM only"),
+    BotCommand("bonus", "Log a bonus — DM only"),
+    BotCommand("avans", "Log a cash advance — DM only"),
+    BotCommand("recentcharges", "List recent charges/bonuses/advances — DM only"),
+    BotCommand("removecharge", "Delete a ledger entry by id — DM only"),
+    BotCommand("setrejectionfee", "Set the flat rejection fee"),
+    BotCommand("setdispatchfee", "Set the company's % of gross"),
+    BotCommand("setcommission", "Set the dispatcher's % of their own gross"),
+]
+
+
+async def sync_bot_commands(app, cfg) -> None:
+    """(Re)registers Telegram's native command menu: a short public list
+    everywhere, and the full admin list in each admin's private chat with the
+    bot (so dispatchers never see admin-only commands cluttering their menu)."""
+    try:
+        await app.bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+        await app.bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeAllGroupChats())
+        for admin_id in cfg.get("admins", []):
+            try:
+                await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+            except Exception:
+                pass  # admin hasn't DM'd the bot yet — Telegram needs that chat to exist first
+    except Exception:
+        logger.exception("Failed to sync the bot's command menu")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cfg = context.bot_data["cfg"]
+    if update.effective_chat.type == ChatType.PRIVATE and is_admin(update.effective_user.id, cfg):
+        # First time this admin DMs the bot, Telegram now has a chat to attach
+        # their full command menu to — register it right away.
+        try:
+            await context.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=update.effective_user.id))
+        except Exception:
+            logger.exception("Failed to set admin command menu for %s", update.effective_user.id)
     await update.message.reply_text(
         "Bot ready. /myid for your Telegram ID. /post in the group for check-in buttons."
     )
@@ -358,6 +429,10 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target not in cfg["admins"]:
         cfg["admins"].append(target)
         save_config(cfg)
+    try:
+        await context.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=target))
+    except Exception:
+        pass  # they haven't DM'd the bot yet; menu will register next time they /start it
     await update.message.reply_text(f"Admin added: {target}")
 
 
@@ -1240,6 +1315,29 @@ def parse_dispatch_board(file_path: str, target_year: int, target_month: int):
 
 # ---- Report generation -----------------------------------------------------
 
+MONEY_FMT = '$#,##0.00'
+MILES_FMT = '#,##0.0'
+RPM_FMT = '#,##0.00'
+COUNT_FMT = '#,##0'
+
+
+def _style_table(ws, header_row, last_row, first_col, last_col, formats=None, center_cols=()):
+    """Borders every cell in the table, applies a per-column number format to
+    the data rows (not the header), and centers the given columns."""
+    from openpyxl.styles import Alignment, Border, Side
+    formats = formats or {}
+    thin = Side(style="thin", color="C9C9C9")
+    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for r in range(header_row, last_row + 1):
+        for c in range(first_col, last_col + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.border = border_all
+            if r > header_row and c in formats:
+                cell.number_format = formats[c]
+            if c in center_cols:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+
 def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_dir: Path):
     """Builds the two xlsx reports. Returns (main_gross_path, dispatchers_gross_path)."""
     from openpyxl import Workbook
@@ -1247,6 +1345,8 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
 
     header_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
     bold = Font(bold=True)
+    red_bold = Font(bold=True, color="C00000")
+    negative_fill = PatternFill(start_color="FDE9E9", end_color="FDE9E9", fill_type="solid")
 
     dispatch_pct = cfg.get("dispatch_fee_percent", 3) / 100.0
     commission_pct = cfg.get("commission_percent", 1) / 100.0
@@ -1337,9 +1437,13 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     ws.title = "Main Gross"
     ws.append([f"Main Gross — {month_label}"])
     ws["A1"].font = Font(bold=True, size=14)
+    ws.merge_cells("A1:E1")
+    ws.row_dimensions[1].height = 22
     ws.append([])
     ws.append(["MC Company", "Loads", "Miles", "RPM ($/mi)", "Gross ($)"])
-    for c in ws[3]:
+    header_row = ws.max_row  # computed AFTER appending real header data — ws.max_row
+                              # lags by a row if read right after an empty spacer append
+    for c in ws[header_row]:
         c.font = bold
         c.fill = header_fill
     for company, d in sorted(by_company.items(), key=lambda x: -x[1]["gross"]):
@@ -1350,31 +1454,50 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     ws.append(total_row)
     for c in ws[ws.max_row]:
         c.font = bold
+    table_end_row = ws.max_row
+    _style_table(ws, header_row, table_end_row, 1, 5,
+                 formats={2: COUNT_FMT, 3: MILES_FMT, 4: RPM_FMT, 5: MONEY_FMT},
+                 center_cols={2, 3, 4})
+    ws.freeze_panes = f"A{header_row + 1}"
 
     ws.append([])
     ws.append(["Average weekly gross", round(avg_weekly_gross, 2)])
+    ws[ws.max_row][1].number_format = MONEY_FMT
     ws.append(["Active days (days with >=1 load)", active_days])
     ws.append(["Total payout to dispatchers (net)", round(total_payout, 2)])
+    ws[ws.max_row][1].number_format = MONEY_FMT
+    if total_payout < 0:
+        ws[ws.max_row][1].font = red_bold
     ws.append([f"Company income ({cfg.get('dispatch_fee_percent',3)}% of gross)", round(company_income, 2)])
+    ws[ws.max_row][1].number_format = MONEY_FMT
 
     ws.append([])
     ws.append(["EXPENSES"])
     ws[ws.max_row][0].font = bold
     ws.append(["Dispatcher salaries, before charges (commission + bonuses)", round(total_earned_before_deductions, 2)])
+    ws[ws.max_row][1].number_format = MONEY_FMT
     ws.append(["Charges deducted (rejections/charges/advances/attendance fines)", round(total_deductions, 2)])
+    ws[ws.max_row][1].number_format = MONEY_FMT
     ws.append(["Dispatcher salaries (net payouts)", round(total_payout, 2)])
     ws[ws.max_row][0].font = bold
+    ws[ws.max_row][1].number_format = MONEY_FMT
+    if total_payout < 0:
+        ws[ws.max_row][1].font = red_bold
     ws.append(["Other company expenses", round(total_company_expenses, 2)])
+    ws[ws.max_row][1].number_format = MONEY_FMT
     for amt, note, ts in company_expenses:
         ws.append(["  • " + (note or ""), round(amt, 2)])
+        ws[ws.max_row][1].number_format = MONEY_FMT
     ws.append([])
     ws.append(["REMAINDER (company income − salaries − other expenses)", round(remainder, 2)])
     ws[ws.max_row][0].font = bold
-    ws[ws.max_row][1].font = bold
+    ws[ws.max_row][1].font = red_bold if remainder < 0 else bold
+    ws[ws.max_row][1].number_format = MONEY_FMT
 
-    for col_cells in ws.columns:
+    from openpyxl.utils import get_column_letter
+    for idx, col_cells in enumerate(ws.columns, start=1):
         length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
-        ws.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 45)
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(length + 2, 12), 55)
 
     main_path = out_dir / f"main_gross_{year:04d}-{month:02d}.xlsx"
     wb1.save(main_path)
@@ -1385,9 +1508,13 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     ws2.title = "Dispatchers Gross"
     ws2.append([f"Dispatchers Gross — {month_label}"])
     ws2["A1"].font = Font(bold=True, size=14)
+    ws2.merge_cells("A1:G1")
+    ws2.row_dimensions[1].height = 22
     ws2.append([])
     ws2.append(["Dispatcher", "Gross ($)", "Commission", "Bonuses", "Advances", "Charges", "Net Dispatch Fee"])
-    for c in ws2[3]:
+    header_row2 = ws2.max_row  # see comment on header_row above — must read max_row
+                                # AFTER the real header append, not right after the blank spacer
+    for c in ws2[header_row2]:
         c.font = bold
         c.fill = header_fill
     for name in sorted(all_dispatcher_names):
@@ -1395,53 +1522,72 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
         ws2.append([name, round(v["gross"], 2), round(v["commission"], 2), round(v["bonus"], 2),
                     round(v["advances"], 2),
                     round(v["charges"] + v["attendance_fines"], 2), round(v["net"], 2)])
+        if v["net"] < 0:
+            net_cell = ws2.cell(row=ws2.max_row, column=7)
+            net_cell.font = red_bold
+            for col in range(1, 8):
+                ws2.cell(row=ws2.max_row, column=col).fill = negative_fill
+    table2_end_row = ws2.max_row
+    _style_table(ws2, header_row2, table2_end_row, 1, 7,
+                 formats={2: MONEY_FMT, 3: MONEY_FMT, 4: MONEY_FMT, 5: MONEY_FMT, 6: MONEY_FMT, 7: MONEY_FMT})
+    ws2.freeze_panes = f"A{header_row2 + 1}"
 
-    ws2.append([])
-    ws2.append(["CHARGE DETAIL (by dispatcher)"])
-    ws2[ws2.max_row][0].font = bold
-    ws2.append(["Dispatcher", "Type", "Amount", "Note", "When"])
-    for c in ws2[ws2.max_row]:
-        c.font = bold
-    for name in sorted(all_dispatcher_names):
-        for kind, amt, note, ts in dispatcher_charges.get(name, []):
-            ws2.append([name, kind, round(amt, 2), note, ts[:16]])
-        fine = attendance_fines.get(name, 0.0)
-        if fine:
-            ws2.append([name, "attendance_fine", round(fine, 2), "late/missing punches", ""])
+    def _detail_section(title, columns, money_col, rows_by_name, extra_rows=None):
+        ws2.append([])
+        ws2.append([title])
+        ws2[ws2.max_row][0].font = bold
+        h_row = ws2.max_row + 1
+        ws2.append(columns)
+        for c in ws2[h_row]:
+            c.font = bold
+            c.fill = header_fill
+        for name in sorted(all_dispatcher_names):
+            for entry in rows_by_name(name):
+                ws2.append(entry)
+            if extra_rows:
+                for entry in extra_rows(name):
+                    ws2.append(entry)
+        end_row = ws2.max_row
+        if end_row > h_row:
+            _style_table(ws2, h_row, end_row, 1, len(columns), formats={money_col: MONEY_FMT})
+        return h_row, end_row
 
-    ws2.append([])
-    ws2.append(["BONUS DETAIL (by dispatcher)"])
-    ws2[ws2.max_row][0].font = bold
-    ws2.append(["Dispatcher", "Amount", "Note", "When"])
-    for c in ws2[ws2.max_row]:
-        c.font = bold
-    for name in sorted(all_dispatcher_names):
-        for amt, note, ts in dispatcher_bonuses.get(name, []):
-            ws2.append([name, round(amt, 2), note, ts[:16]])
-
-    ws2.append([])
-    ws2.append(["ADVANCE DETAIL (by dispatcher)"])
-    ws2[ws2.max_row][0].font = bold
-    ws2.append(["Dispatcher", "Amount", "Note", "When"])
-    for c in ws2[ws2.max_row]:
-        c.font = bold
-    for name in sorted(all_dispatcher_names):
-        for amt, note, ts in dispatcher_advances.get(name, []):
-            ws2.append([name, round(amt, 2), note, ts[:16]])
+    _detail_section(
+        "CHARGE DETAIL (by dispatcher)", ["Dispatcher", "Type", "Amount", "Note", "When"], 3,
+        rows_by_name=lambda name: [[name, kind, round(amt, 2), note, ts[:16]]
+                                     for kind, amt, note, ts in dispatcher_charges.get(name, [])],
+        extra_rows=lambda name: ([[name, "attendance_fine", round(attendance_fines[name], 2),
+                                    "late/missing punches", ""]] if attendance_fines.get(name) else []),
+    )
+    _detail_section(
+        "BONUS DETAIL (by dispatcher)", ["Dispatcher", "Amount", "Note", "When"], 2,
+        rows_by_name=lambda name: [[name, round(amt, 2), note, ts[:16]]
+                                     for amt, note, ts in dispatcher_bonuses.get(name, [])],
+    )
+    _detail_section(
+        "ADVANCE DETAIL (by dispatcher)", ["Dispatcher", "Amount", "Note", "When"], 2,
+        rows_by_name=lambda name: [[name, round(amt, 2), note, ts[:16]]
+                                     for amt, note, ts in dispatcher_advances.get(name, [])],
+    )
 
     ws2.append([])
     ws2.append(["GROSS DETAIL — by company (per dispatcher)"])
     ws2[ws2.max_row][0].font = bold
+    h_row3 = ws2.max_row + 1
     ws2.append(["Dispatcher", "MC Company", "Gross ($)"])
-    for c in ws2[ws2.max_row]:
+    for c in ws2[h_row3]:
         c.font = bold
+        c.fill = header_fill
     for name in sorted(by_dispatcher):
         for company, amt in sorted(by_dispatcher[name]["by_company"].items(), key=lambda x: -x[1]):
             ws2.append([name, company, round(amt, 2)])
+    if ws2.max_row > h_row3:
+        _style_table(ws2, h_row3, ws2.max_row, 1, 3, formats={3: MONEY_FMT})
 
-    for col_cells in ws2.columns:
+    from openpyxl.utils import get_column_letter
+    for idx, col_cells in enumerate(ws2.columns, start=1):
         length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
-        ws2.column_dimensions[col_cells[0].column_letter].width = min(max(length + 2, 12), 45)
+        ws2.column_dimensions[get_column_letter(idx)].width = min(max(length + 2, 12), 45)
 
     disp_path = out_dir / f"dispatchers_gross_{year:04d}-{month:02d}.xlsx"
     wb2.save(disp_path)
@@ -1524,7 +1670,10 @@ def main():
     init_db()
     cfg = load_config()
 
-    app = Application.builder().token(token).build()
+    async def post_init(application: Application) -> None:
+        await sync_bot_commands(application, application.bot_data["cfg"])
+
+    app = Application.builder().token(token).post_init(post_init).build()
     app.bot_data["cfg"] = cfg
 
     # basic / attendance
