@@ -45,6 +45,7 @@ import json
 import csv
 import io
 import logging
+import re
 import sqlite3
 from datetime import datetime, timedelta, time as dtime, date as ddate
 from pathlib import Path
@@ -157,10 +158,17 @@ def init_db() -> None:
             amount REAL NOT NULL,            -- always positive; sign is implied by kind
             note TEXT,
             added_by INTEGER,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            entry_month TEXT                 -- 'YYYY-MM' this entry counts toward in reports; usually
+                                              -- the month it was logged in, but can be backdated
+                                              -- (e.g. /charge 15 September sleeping, logged in October)
         )
         """
     )
+    existing_ledger_cols = {row[1] for row in conn.execute("PRAGMA table_info(ledger)")}
+    if "entry_month" not in existing_ledger_cols:
+        conn.execute("ALTER TABLE ledger ADD COLUMN entry_month TEXT")
+    conn.execute("UPDATE ledger SET entry_month = substr(created_at, 1, 7) WHERE entry_month IS NULL")
     conn.commit()
     conn.close()
 
@@ -178,15 +186,54 @@ def log_action(user_id, full_name, username, action, shift, shift_date, ts, stat
     conn.close()
 
 
-def log_ledger(kind, dispatcher_name, amount, note, added_by, tz):
+def log_ledger(kind, dispatcher_name, amount, note, added_by, tz, entry_month=None):
+    """entry_month, if given, is a 'YYYY-MM' string that overrides which month's
+    report this entry counts toward (for backdated corrections). Returns the new
+    row's id, shown to the admin so a mistake can be undone with /removecharge."""
+    now = datetime.now(tz)
+    if not entry_month:
+        entry_month = f"{now.year:04d}-{now.month:02d}"
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO ledger (kind, dispatcher_name, amount, note, added_by, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (kind, dispatcher_name, amount, note, added_by, datetime.now(tz).isoformat()),
+    cur = conn.execute(
+        "INSERT INTO ledger (kind, dispatcher_name, amount, note, added_by, created_at, entry_month) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (kind, dispatcher_name, amount, note, added_by, now.isoformat(), entry_month),
     )
     conn.commit()
+    row_id = cur.lastrowid
     conn.close()
+    return row_id
+
+
+def _extract_month_arg(args: list, tz) -> tuple:
+    """Scans a command's args for a month name (e.g. 'September', optionally
+    followed by a 4-digit year like 'September 2026') and strips it out,
+    wherever it appears. Returns (remaining_args, entry_month, month_label):
+      - entry_month: 'YYYY-MM' to file the entry under, or None if no month
+        was given (caller then defaults to the current month).
+      - month_label: human-readable string ('September 2026') for the
+        confirmation message, or None if no month was given.
+    If a year isn't given, assumes the current year — unless that month
+    hasn't happened yet this year, in which case it assumes last year
+    (so '/charge 15 December ...' typed in January means last December).
+    """
+    now = datetime.now(tz)
+    new_args = list(args)
+    for i, a in enumerate(new_args):
+        low = a.lower().strip(",.()")
+        if low in MONTH_NAMES:
+            month_num = MONTH_NAMES[low]
+            del new_args[i]
+            year_num = now.year
+            if i < len(new_args) and re.fullmatch(r"(19|20)\d{2}", new_args[i]):
+                year_num = int(new_args[i])
+                del new_args[i]
+            elif year_num == now.year and month_num > now.month:
+                year_num -= 1
+            entry_month = f"{year_num:04d}-{month_num:02d}"
+            month_label = ddate(year_num, month_num, 1).strftime("%B %Y")
+            return new_args, entry_month, month_label
+    return new_args, None, None
 
 
 # --------------------------------------------------------------------------
@@ -780,14 +827,19 @@ async def cmd_rejection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, cfg):
         await update.message.reply_text("Admins only.")
         return
-    name_arg = context.args[0] if context.args else None
+    args, entry_month, month_label = _extract_month_arg(context.args, get_tz(cfg))
+    name_arg = args[0] if args else None
     sheet_name, display = _resolve_dispatcher_target(cfg, update, name_arg)
     if not sheet_name:
-        await update.message.reply_text("Reply to the dispatcher's message with /rejection, or use /rejection <name>.")
+        await update.message.reply_text(
+            "Reply to the dispatcher's message with /rejection, or use /rejection <name>.\n"
+            "Optionally add a month to backdate it, e.g. /rejection Asilbek September."
+        )
         return
     fee = cfg.get("rejection_fee", 50)
-    log_ledger("rejection", sheet_name, fee, "rejection", update.effective_user.id, get_tz(cfg))
-    await update.message.reply_text(f"🔻 Rejection charge logged for {display}: ${fee:.0f}")
+    entry_id = log_ledger("rejection", sheet_name, fee, "rejection", update.effective_user.id, get_tz(cfg), entry_month)
+    suffix = f" (for {month_label}, id {entry_id})" if month_label else f" (id {entry_id})"
+    await update.message.reply_text(f"🔻 Rejection charge logged for {display}: ${fee:.0f}{suffix}")
 
 
 async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -795,16 +847,22 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, cfg):
         await update.message.reply_text("Admins only.")
         return
-    args = context.args
+    args, entry_month, month_label = _extract_month_arg(context.args, get_tz(cfg))
     if update.message.reply_to_message:
         if len(args) < 2:
-            await update.message.reply_text("Usage (as reply): /charge <amount> <reason...>")
+            await update.message.reply_text(
+                "Usage (as reply): /charge <amount> <reason...>\n"
+                "Optionally add a month anywhere to backdate it, e.g. /charge 15 September sleeping"
+            )
             return
         amount_str, reason = args[0], " ".join(args[1:])
         sheet_name, display = _resolve_dispatcher_target(cfg, update)
     else:
         if len(args) < 3:
-            await update.message.reply_text("Usage: /charge <name> <amount> <reason...>  (or reply to their message)")
+            await update.message.reply_text(
+                "Usage: /charge <name> <amount> <reason...>  (or reply to their message)\n"
+                "Optionally add a month anywhere to backdate it, e.g. /charge Asilbek 15 September sleeping"
+            )
             return
         name_arg, amount_str, reason = args[0], args[1], " ".join(args[2:])
         sheet_name, display = _resolve_dispatcher_target(cfg, update, name_arg)
@@ -815,8 +873,9 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"'{amount_str}' isn't a valid amount.")
         return
 
-    log_ledger("other_charge", sheet_name, amount, reason, update.effective_user.id, get_tz(cfg))
-    await update.message.reply_text(f"🔻 Charge logged for {display}: ${amount:.0f} — {reason}")
+    entry_id = log_ledger("other_charge", sheet_name, amount, reason, update.effective_user.id, get_tz(cfg), entry_month)
+    suffix = f" (for {month_label}, id {entry_id})" if month_label else f" (id {entry_id})"
+    await update.message.reply_text(f"🔻 Charge logged for {display}: ${amount:.0f} — {reason}{suffix}")
 
 
 async def cmd_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -827,9 +886,12 @@ async def cmd_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, cfg):
         await update.message.reply_text("Admins only.")
         return
-    args = context.args
+    args, entry_month, month_label = _extract_month_arg(context.args, get_tz(cfg))
     if len(args) < 2:
-        await update.message.reply_text("Usage (DM only): /expense <amount> <description...>")
+        await update.message.reply_text(
+            "Usage (DM only): /expense <amount> <description...>\n"
+            "Optionally add a month anywhere to backdate it, e.g. /expense 300 September fuel reimbursement"
+        )
         return
     try:
         amount = float(args[0])
@@ -837,8 +899,9 @@ async def cmd_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"'{args[0]}' isn't a valid amount.")
         return
     description = " ".join(args[1:])
-    log_ledger("company_expense", None, amount, description, update.effective_user.id, get_tz(cfg))
-    await update.message.reply_text(f"Company expense logged privately: ${amount:.0f} — {description}")
+    entry_id = log_ledger("company_expense", None, amount, description, update.effective_user.id, get_tz(cfg), entry_month)
+    suffix = f" (for {month_label}, id {entry_id})" if month_label else f" (id {entry_id})"
+    await update.message.reply_text(f"Company expense logged privately: ${amount:.0f} — {description}{suffix}")
 
 
 async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -849,9 +912,12 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id, cfg):
         await update.message.reply_text("Admins only.")
         return
-    args = context.args
+    args, entry_month, month_label = _extract_month_arg(context.args, get_tz(cfg))
     if not args or len(args) < 2:
-        await update.message.reply_text("Usage (DM only): /bonus <dispatcher_sheet_name> <amount> [note...]")
+        await update.message.reply_text(
+            "Usage (DM only): /bonus <dispatcher_sheet_name> <amount> [note...]\n"
+            "Optionally add a month anywhere to backdate it, e.g. /bonus Doniyor 100 September great month"
+        )
         return
     name_arg, amount_str = args[0], args[1]
     note = " ".join(args[2:]) if len(args) > 2 else "bonus"
@@ -860,8 +926,91 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text(f"'{amount_str}' isn't a valid amount.")
         return
-    log_ledger("bonus", name_arg, amount, note, update.effective_user.id, get_tz(cfg))
-    await update.message.reply_text(f"🎁 Bonus logged for {name_arg}: ${amount:.0f} — {note}")
+    entry_id = log_ledger("bonus", name_arg, amount, note, update.effective_user.id, get_tz(cfg), entry_month)
+    suffix = f" (for {month_label}, id {entry_id})" if month_label else f" (id {entry_id})"
+    await update.message.reply_text(f"🎁 Bonus logged for {name_arg}: ${amount:.0f} — {note}{suffix}")
+
+
+LEDGER_KIND_LABEL = {
+    "rejection": "Rejection", "other_charge": "Charge",
+    "bonus": "Bonus", "company_expense": "Expense",
+}
+
+
+async def cmd_recentcharges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DM only: lists the most recent ledger entries (rejections, charges,
+    bonuses, expenses) with their ids, so a mistaken one can be found and
+    removed with /removecharge <id>. Optionally filter: /recentcharges <name>."""
+    cfg = context.bot_data["cfg"]
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("Please DM me this command.")
+        return
+    if not is_admin(update.effective_user.id, cfg):
+        await update.message.reply_text("Admins only.")
+        return
+    args = context.args
+    name_filter = None
+    limit = 20
+    for a in args:
+        if a.isdigit():
+            limit = min(int(a), 100)
+        else:
+            name_filter = a
+    conn = sqlite3.connect(DB_PATH)
+    if name_filter:
+        rows = conn.execute(
+            "SELECT id, kind, dispatcher_name, amount, note, entry_month FROM ledger "
+            "WHERE dispatcher_name LIKE ? ORDER BY id DESC LIMIT ?",
+            (f"%{name_filter}%", limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, kind, dispatcher_name, amount, note, entry_month FROM ledger "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("No ledger entries found.")
+        return
+    lines = ["🧾 Most recent ledger entries (newest first):"]
+    for rid, kind, name, amount, note, entry_month in rows:
+        who = name or "(company)"
+        lines.append(f"#{rid} — {LEDGER_KIND_LABEL.get(kind, kind)} — {who} — ${amount:.0f} — {note} — {entry_month}")
+    lines.append("\nTo delete a mistaken entry: /removecharge <id>")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_removecharge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DM only: deletes one ledger entry (rejection/charge/bonus/expense) by
+    id. Use /recentcharges first to find the id."""
+    cfg = context.bot_data["cfg"]
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("Please DM me this command.")
+        return
+    if not is_admin(update.effective_user.id, cfg):
+        await update.message.reply_text("Admins only.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /removecharge <id>  (see /recentcharges for ids)")
+        return
+    rid = int(context.args[0])
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT kind, dispatcher_name, amount, note, entry_month FROM ledger WHERE id = ?", (rid,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        await update.message.reply_text(f"No ledger entry with id {rid}.")
+        return
+    conn.execute("DELETE FROM ledger WHERE id = ?", (rid,))
+    conn.commit()
+    conn.close()
+    kind, name, amount, note, entry_month = row
+    who = name or "(company)"
+    await update.message.reply_text(
+        f"🗑 Deleted entry #{rid} — {LEDGER_KIND_LABEL.get(kind, kind)} — {who} — ${amount:.0f} — {note} — {entry_month}"
+    )
 
 
 async def cmd_setrejectionfee(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1097,7 +1246,7 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     conn = sqlite3.connect(DB_PATH)
     ledger_rows = conn.execute(
         "SELECT kind, dispatcher_name, amount, note, created_at FROM ledger "
-        "WHERE strftime('%Y-%m', created_at) = ?",
+        "WHERE entry_month = ?",
         (f"{year:04d}-{month:02d}",),
     ).fetchall()
     conn.close()
@@ -1349,6 +1498,8 @@ def main():
     app.add_handler(CommandHandler("charge", cmd_charge))
     app.add_handler(CommandHandler("expense", cmd_expense))
     app.add_handler(CommandHandler("bonus", cmd_bonus))
+    app.add_handler(CommandHandler("recentcharges", cmd_recentcharges))
+    app.add_handler(CommandHandler("removecharge", cmd_removecharge))
     app.add_handler(CommandHandler("setrejectionfee", cmd_setrejectionfee))
     app.add_handler(CommandHandler("setdispatchfee", cmd_setdispatchfee))
     app.add_handler(CommandHandler("setcommission", cmd_setcommission))
