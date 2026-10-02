@@ -63,6 +63,7 @@ Check it worked with `/workers` — it'll show the linked sheet name next to eac
 ```
 /expense 300 fuel reimbursement
 /bonus Doniyor 100 great month
+/avans Asilbek 100 September            (cash advance — deducted from their net payout)
 ```
 
 ### Backdating a charge/bonus/expense to an earlier month
@@ -77,6 +78,7 @@ in:
 /rejection Asilbek September
 /bonus Doniyor 100 September great month
 /expense 300 September fuel reimbursement
+/avans Asilbek 100 September
 ```
 No year needed — it assumes the current year, or last year if that month
 hasn't happened yet this year (so typing "December" in January means last
@@ -110,7 +112,7 @@ Change the rules any time:
 2. **DM the file to the bot** (not the group). In the caption, write the month you want, e.g. `September 2026` or `2026-09`. If you leave the caption blank, it uses the most recent month found in the file.
 3. The bot replies privately with two files:
    - **Main Gross** — per-MC-company breakdown (loads, miles, RPM, gross), average weekly gross, active days, total payout, company income (your %), expenses, and the final remainder.
-   - **Dispatchers Gross** — per dispatcher: gross (with a breakdown by company further down), commission, bonuses, charges (itemized below), and their net dispatch fee (commission + bonuses − charges, including attendance fines).
+   - **Dispatchers Gross** — per dispatcher: gross (with a breakdown by company further down), commission, bonuses, advances (cash avans, itemized below), charges (itemized below), and their net dispatch fee (commission + bonuses − advances − charges, including attendance fines).
 
 Only you receive these (not the 4 bosses) — forward them yourself if you want to share.
 
@@ -131,6 +133,7 @@ Only you receive these (not the 4 bosses) — forward them yourself if you want 
 | `/charge <amount> <reason>` (reply) / `/charge <name> <amount> <reason>` | Admin | Group |
 | `/expense <amount> <description>` | Admin | **DM only** |
 | `/bonus <name> <amount> <note>` | Admin | **DM only** |
+| `/avans <name> <amount> [note]` | Admin | **DM only** |
 | `/recentcharges [name] [limit]` | Admin | **DM only** |
 | `/removecharge <id>` | Admin | **DM only** |
 | `/setrejectionfee <amount>` | Admin | Either |
