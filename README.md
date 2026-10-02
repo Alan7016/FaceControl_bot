@@ -65,6 +65,37 @@ Check it worked with `/workers` — it'll show the linked sheet name next to eac
 /bonus Doniyor 100 great month
 ```
 
+### Backdating a charge/bonus/expense to an earlier month
+
+If you only remember a charge later — e.g. it's October but the incident was
+in September — drop the month name anywhere in the command and it'll be
+filed under that month's report instead of whatever month you're logging it
+in:
+```
+/charge 15 September sleeping          (reply to their message)
+/charge Asilbek 15 September sleeping  (direct)
+/rejection Asilbek September
+/bonus Doniyor 100 September great month
+/expense 300 September fuel reimbursement
+```
+No year needed — it assumes the current year, or last year if that month
+hasn't happened yet this year (so typing "December" in January means last
+December). Add a year explicitly if you need to go further back, e.g.
+`/charge 15 September 2025 sleeping`.
+
+Every logged entry replies with an **id** (e.g. "id 42") — keep that if you
+might need to undo it.
+
+### Fixing a mistake
+
+DM the bot privately (admin only):
+```
+/recentcharges            (last 20 entries, newest first, with their ids)
+/recentcharges Asilbek    (only entries for that name)
+/recentcharges 50         (show up to 50 instead of 20)
+/removecharge 42          (deletes entry #42 — works for any rejection/charge/bonus/expense)
+```
+
 Change the rules any time:
 ```
 /setrejectionfee 50       (dollar amount per rejection)
@@ -100,6 +131,8 @@ Only you receive these (not the 4 bosses) — forward them yourself if you want 
 | `/charge <amount> <reason>` (reply) / `/charge <name> <amount> <reason>` | Admin | Group |
 | `/expense <amount> <description>` | Admin | **DM only** |
 | `/bonus <name> <amount> <note>` | Admin | **DM only** |
+| `/recentcharges [name] [limit]` | Admin | **DM only** |
+| `/removecharge <id>` | Admin | **DM only** |
 | `/setrejectionfee <amount>` | Admin | Either |
 | `/setdispatchfee <percent>` | Admin | Either |
 | `/setcommission <percent>` | Admin | Either |
