@@ -931,9 +931,39 @@ async def cmd_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎁 Bonus logged for {name_arg}: ${amount:.0f} — {note}{suffix}")
 
 
+async def cmd_avans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """DM only: logs a cash advance (avans) paid to a dispatcher — money already
+    handed to them, deducted from their net dispatch fee at month-end, same as
+    a charge but tracked separately so it shows as its own column."""
+    cfg = context.bot_data["cfg"]
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("Please DM me this command.")
+        return
+    if not is_admin(update.effective_user.id, cfg):
+        await update.message.reply_text("Admins only.")
+        return
+    args, entry_month, month_label = _extract_month_arg(context.args, get_tz(cfg))
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Usage (DM only): /avans <dispatcher_sheet_name> <amount> [note...]\n"
+            "Optionally add a month anywhere to backdate it, e.g. /avans Asilbek 100 September"
+        )
+        return
+    name_arg, amount_str = args[0], args[1]
+    note = " ".join(args[2:]) if len(args) > 2 else "avans"
+    try:
+        amount = float(amount_str)
+    except ValueError:
+        await update.message.reply_text(f"'{amount_str}' isn't a valid amount.")
+        return
+    entry_id = log_ledger("advance", name_arg, amount, note, update.effective_user.id, get_tz(cfg), entry_month)
+    suffix = f" (for {month_label}, id {entry_id})" if month_label else f" (id {entry_id})"
+    await update.message.reply_text(f"💵 Advance logged for {name_arg}: ${amount:.0f} — {note}{suffix}")
+
+
 LEDGER_KIND_LABEL = {
     "rejection": "Rejection", "other_charge": "Charge",
-    "bonus": "Bonus", "company_expense": "Expense",
+    "bonus": "Bonus", "company_expense": "Expense", "advance": "Advance",
 }
 
 
@@ -1254,11 +1284,14 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     company_expenses = [(amt, note, ts) for kind, name, amt, note, ts in ledger_rows if kind == "company_expense"]
     dispatcher_charges = {}   # sheet_name -> [(kind, amount, note, ts), ...]
     dispatcher_bonuses = {}   # sheet_name -> [(amount, note, ts), ...]
+    dispatcher_advances = {}  # sheet_name -> [(amount, note, ts), ...]
     for kind, name, amt, note, ts in ledger_rows:
         if kind in ("rejection", "other_charge") and name:
             dispatcher_charges.setdefault(name, []).append((kind, amt, note, ts))
         elif kind == "bonus" and name:
             dispatcher_bonuses.setdefault(name, []).append((amt, note, ts))
+        elif kind == "advance" and name:
+            dispatcher_advances.setdefault(name, []).append((amt, note, ts))
 
     attendance_fines = get_monthly_attendance_fines(cfg, year, month)
 
@@ -1271,7 +1304,8 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     days_in_month = calendar.monthrange(year, month)[1]
     avg_weekly_gross = total_gross / (days_in_month / 7.0) if days_in_month else 0
 
-    all_dispatcher_names = set(by_dispatcher) | set(dispatcher_charges) | set(dispatcher_bonuses) | set(attendance_fines)
+    all_dispatcher_names = (set(by_dispatcher) | set(dispatcher_charges) | set(dispatcher_bonuses)
+                             | set(dispatcher_advances) | set(attendance_fines))
 
     net_payouts = {}
     for name in all_dispatcher_names:
@@ -1279,11 +1313,13 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
         commission = gross * commission_pct
         bonus_total = sum(a for a, _, _ in dispatcher_bonuses.get(name, []))
         charge_total = sum(a for _, a, _, _ in dispatcher_charges.get(name, []))
+        advance_total = sum(a for a, _, _ in dispatcher_advances.get(name, []))
         fine_total = attendance_fines.get(name, 0.0)
-        net = commission + bonus_total - charge_total - fine_total
+        net = commission + bonus_total - charge_total - advance_total - fine_total
         net_payouts[name] = {
             "gross": gross, "commission": commission, "bonus": bonus_total,
-            "charges": charge_total, "attendance_fines": fine_total, "net": net,
+            "charges": charge_total, "advances": advance_total,
+            "attendance_fines": fine_total, "net": net,
         }
 
     total_payout = sum(v["net"] for v in net_payouts.values())
@@ -1345,13 +1381,14 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     ws2.append([f"Dispatchers Gross — {month_label}"])
     ws2["A1"].font = Font(bold=True, size=14)
     ws2.append([])
-    ws2.append(["Dispatcher", "Gross ($)", "Commission", "Bonuses", "Charges", "Net Dispatch Fee"])
+    ws2.append(["Dispatcher", "Gross ($)", "Commission", "Bonuses", "Advances", "Charges", "Net Dispatch Fee"])
     for c in ws2[3]:
         c.font = bold
         c.fill = header_fill
     for name in sorted(all_dispatcher_names):
         v = net_payouts[name]
         ws2.append([name, round(v["gross"], 2), round(v["commission"], 2), round(v["bonus"], 2),
+                    round(v["advances"], 2),
                     round(v["charges"] + v["attendance_fines"], 2), round(v["net"], 2)])
 
     ws2.append([])
@@ -1375,6 +1412,16 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
         c.font = bold
     for name in sorted(all_dispatcher_names):
         for amt, note, ts in dispatcher_bonuses.get(name, []):
+            ws2.append([name, round(amt, 2), note, ts[:16]])
+
+    ws2.append([])
+    ws2.append(["ADVANCE DETAIL (by dispatcher)"])
+    ws2[ws2.max_row][0].font = bold
+    ws2.append(["Dispatcher", "Amount", "Note", "When"])
+    for c in ws2[ws2.max_row]:
+        c.font = bold
+    for name in sorted(all_dispatcher_names):
+        for amt, note, ts in dispatcher_advances.get(name, []):
             ws2.append([name, round(amt, 2), note, ts[:16]])
 
     ws2.append([])
@@ -1498,6 +1545,7 @@ def main():
     app.add_handler(CommandHandler("charge", cmd_charge))
     app.add_handler(CommandHandler("expense", cmd_expense))
     app.add_handler(CommandHandler("bonus", cmd_bonus))
+    app.add_handler(CommandHandler("avans", cmd_avans))
     app.add_handler(CommandHandler("recentcharges", cmd_recentcharges))
     app.add_handler(CommandHandler("removecharge", cmd_removecharge))
     app.add_handler(CommandHandler("setrejectionfee", cmd_setrejectionfee))
