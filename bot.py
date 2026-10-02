@@ -1323,6 +1323,8 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
         }
 
     total_payout = sum(v["net"] for v in net_payouts.values())
+    total_earned_before_deductions = sum(v["commission"] + v["bonus"] for v in net_payouts.values())
+    total_deductions = sum(v["charges"] + v["advances"] + v["attendance_fines"] for v in net_payouts.values())
     company_income = total_gross * dispatch_pct
     total_company_expenses = sum(a for a, _, _ in company_expenses)
     remainder = company_income - total_payout - total_company_expenses
@@ -1358,7 +1360,10 @@ def generate_finance_reports(cfg: dict, loads: list, year: int, month: int, out_
     ws.append([])
     ws.append(["EXPENSES"])
     ws[ws.max_row][0].font = bold
+    ws.append(["Dispatcher salaries, before charges (commission + bonuses)", round(total_earned_before_deductions, 2)])
+    ws.append(["Charges deducted (rejections/charges/advances/attendance fines)", round(total_deductions, 2)])
     ws.append(["Dispatcher salaries (net payouts)", round(total_payout, 2)])
+    ws[ws.max_row][0].font = bold
     ws.append(["Other company expenses", round(total_company_expenses, 2)])
     for amt, note, ts in company_expenses:
         ws.append(["  • " + (note or ""), round(amt, 2)])
